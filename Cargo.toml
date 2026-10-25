@@ -1,0 +1,21 @@
+[package]
+name = "planar"
+version = "0.1.0"
+edition = "2024"
+description = "Planar - a file explorer on an infinite canvas"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "x11", "wayland"] }
+egui = { version = "0.37", features = ["serde"] }
+open = "5"
+trash = "5"
+serde = { version = "1", features = ["derive"] }
+rfd = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

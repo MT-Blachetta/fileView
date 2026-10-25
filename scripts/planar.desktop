@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Planar
+Comment=File explorer on an infinite canvas
+Exec=planar %f
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
