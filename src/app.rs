@@ -2,7 +2,8 @@
 //! menus, dialogs). Canvas rendering and pointer interaction live in
 //! `canvas.rs`.
 
-use crate::canvas::{Camera, Gesture, Hit};
+use crate::arrange::{Arrangement, DirOrder};
+use crate::canvas::{Camera, Gesture, Hit, ReorderPlan};
 use crate::fsmodel::{self, SortKey, Tree};
 use crate::layout::{Kind, Layout};
 use crate::ops::{self, Job, JobKind, JobResult};
@@ -152,6 +153,8 @@ pub enum Undo {
     Move(Vec<(PathBuf, PathBuf)>),
     Rename(PathBuf, PathBuf),
     Created(Vec<PathBuf>),
+    /// Arrangement of the canvas root (first field) before a change.
+    Arrange(PathBuf, Box<DirOrder>),
 }
 
 pub enum Confirm {
@@ -179,6 +182,10 @@ pub struct App {
     scan_again: bool,
     pub expand: HashMap<PathBuf, bool>,
     pub custom_sizes: HashMap<PathBuf, Vec2>,
+    /// Custom order of the items, stored in the root's layout file.
+    pub arrange: Arrangement,
+    /// The arrangement changed and has to be written.
+    arrange_dirty: bool,
     pub settings: Settings,
 
     pub cam: Camera,
@@ -195,6 +202,8 @@ pub struct App {
     pub hover: Option<Hit>,
     pub hover_clip: Option<usize>,
     pub drop: DropTarget,
+    /// Rearrangement shown while dragging items inside their own folder.
+    pub reorder: Option<ReorderPlan>,
     pub menu: Option<MenuTarget>,
     pub rename: Option<RenameState>,
 
@@ -262,6 +271,9 @@ impl App {
             scan_again: false,
             expand: persisted.expand.into_iter().filter(|(p, _)| p.exists()).collect(),
             custom_sizes: persisted.custom_sizes.into_iter().filter(|(p, _)| p.exists()).collect(),
+            // Read before the first layout so the canvas opens arranged.
+            arrange: Arrangement::load(&root),
+            arrange_dirty: false,
             settings: persisted.settings,
             cam: Camera::default(),
             clip_cam: Camera::default(),
@@ -276,6 +288,7 @@ impl App {
             hover: None,
             hover_clip: None,
             drop: DropTarget::None,
+            reorder: None,
             menu: None,
             rename: None,
             search: String::new(),
@@ -355,6 +368,7 @@ impl App {
                     if let Some(e) = &tree.root_node().error {
                         self.toast(format!("Cannot read folder: {e}"), ToastKind::Error);
                     }
+                    self.arrange.merge_nested(&tree.layout_files);
                     self.tree = tree;
                     self.layout_dirty = true;
                     self.dir_stats.clear();
@@ -386,13 +400,14 @@ impl App {
             opts.auto_depth = 0;
             opts.budget = 20_000;
             let sub = Tree::scan(path, &opts);
+            self.arrange.merge_nested(&sub.layout_files);
             graft(&mut self.tree, id, sub);
         }
         self.layout_dirty = true;
     }
 
     fn relayout(&mut self) {
-        self.layout = Layout::compute(&self.tree, &self.custom_sizes);
+        self.layout = Layout::compute(&self.tree, &self.custom_sizes, &self.arrange);
         self.layout_dirty = false;
         self.sel.retain(|p| p.exists());
         self.update_matches();
@@ -415,6 +430,8 @@ impl App {
             self.back.push(self.root.clone());
             self.fwd.clear();
         }
+        self.save_arrangement();
+        self.arrange = Arrangement::load(&path);
         self.root = path;
         self.path_input = self.root.display().to_string();
         self.tree = Tree::empty(&self.root);
@@ -457,6 +474,61 @@ impl App {
             self.set_root(ctx, path.to_path_buf(), true);
         } else if let Err(e) = ops::open_default(path) {
             self.toast(format!("Could not open: {e}"), ToastKind::Error);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Arrangement
+
+    /// Applies a rearrangement made by dragging (undoable).
+    pub fn apply_reorder(&mut self, plan: ReorderPlan) {
+        if plan.files.is_none() && plan.rows.is_none() {
+            return; // dropped where it was
+        }
+        let before = self.arrange.tree.clone();
+        self.arrange.set_order(&plan.dir, plan.files, plan.rows);
+        self.arrangement_changed(before);
+    }
+
+    /// Returns folder `dir` to the sort order (sub-folders keep theirs).
+    pub fn reset_arrangement(&mut self, dir: &Path) {
+        let before = self.arrange.tree.clone();
+        if self.arrange.reset(dir) {
+            self.arrangement_changed(before);
+            self.toast(format!("\u{201c}{}\u{201d} is sorted by {} again", fsmodel::display_name(dir), self.settings.sort.label().to_lowercase()), ToastKind::Info);
+        }
+    }
+
+    /// Drops every custom order of the current canvas.
+    pub fn reset_all_arrangements(&mut self) {
+        let before = std::mem::take(&mut self.arrange.tree);
+        self.arrangement_changed(before);
+    }
+
+    fn arrangement_changed(&mut self, before: DirOrder) {
+        if self.arrange.tree != before {
+            self.push_undo(Undo::Arrange(self.root.clone(), Box::new(before)));
+            self.arrange_dirty = true;
+            self.layout_dirty = true;
+        }
+    }
+
+    /// Writes pending arrangement changes to the layout file(s).
+    fn save_arrangement(&mut self) {
+        if !std::mem::take(&mut self.arrange_dirty) {
+            return;
+        }
+        match self.arrange.save() {
+            Ok(written) => {
+                // Writing changes the folder's modification time; that is not
+                // an external change that needs a rescan.
+                for (p, m) in &mut self.tree.dir_mtimes {
+                    if written.contains(p) {
+                        *m = std::fs::metadata(&*p).and_then(|md| md.modified()).ok();
+                    }
+                }
+            }
+            Err(e) => self.toast(format!("Could not save the arrangement: {e}"), ToastKind::Error),
         }
     }
 
@@ -629,6 +701,7 @@ impl App {
                 for (p, _) in &r.done {
                     self.clip.retain(|c| &c.path != p);
                     self.sel.remove(p);
+                    self.arrange_dirty |= self.arrange.forget(p);
                 }
                 if n > 0 && !r.is_undo {
                     let what = if r.kind == JobKind::Trash { "Moved to trash:" } else { "Deleted" };
@@ -657,6 +730,7 @@ impl App {
         }
         remap(&mut self.custom_sizes, from, to);
         remap(&mut self.expand, from, to);
+        self.arrange_dirty |= self.arrange.rekey(from, to);
         if self.sel.remove(from) {
             self.sel.insert(to.to_path_buf());
         }
@@ -699,6 +773,21 @@ impl App {
             Undo::Created(paths) => {
                 let pairs = paths.into_iter().map(|p| (p.clone(), p)).collect();
                 self.spawn_job(ctx, Job { kind: JobKind::Trash, pairs, is_undo: true });
+            }
+            Undo::Arrange(root, before) => {
+                if root == self.root {
+                    self.arrange.tree = *before;
+                    self.arrange_dirty = true;
+                    self.layout_dirty = true;
+                } else {
+                    let mut a = Arrangement::load(&root);
+                    a.tree = *before;
+                    if let Err(e) = a.save() {
+                        self.toast(format!("Could not save the arrangement: {e}"), ToastKind::Error);
+                        return;
+                    }
+                }
+                self.toast("Undone \u{2014} arrangement restored".into(), ToastKind::Info);
             }
         }
     }
@@ -1000,6 +1089,7 @@ impl App {
                 self.dir_stats.insert(p, Some(s));
             }
         }
+        self.save_arrangement();
         if self.layout_dirty {
             self.relayout();
         }
@@ -1340,6 +1430,13 @@ impl App {
             self.expand.clear();
             rescan = true;
         }
+        if !self.arrange.tree.is_empty()
+            && pill(ui, "Reset arrangement of this canvas")
+                .on_hover_text("Items you rearranged by dragging follow the sort order again (Ctrl+Z restores).")
+                .clicked()
+        {
+            self.reset_all_arrangements();
+        }
         if rescan {
             self.request_scan(ctx);
         }
@@ -1380,7 +1477,8 @@ impl App {
                 ui.label(RichText::new(format!("{:.0}%", self.cam.zoom * 100.0)).small().color(theme::MUTED));
                 let key = self.toggle_key_label();
                 let hint = match (&self.gesture, self.tool) {
-                    (Gesture::Drag { .. }, _) => "Drop on a folder to move \u{00B7} hold Ctrl to copy \u{00B7} drop on the left area to stage in clipboard".to_string(),
+                    (Gesture::Drag { .. }, _) if self.reorder.is_some() => "Drop to rearrange \u{00B7} between folders of a row, or in the gap above / below a row for a new row".to_string(),
+                    (Gesture::Drag { .. }, _) => "Drop on a folder to move \u{00B7} hold Ctrl to copy \u{00B7} drop between items of their own folder to rearrange".to_string(),
                     (_, Tool::Pan) => format!("Drag to move the canvas \u{00B7} {key} or middle click: back to select"),
                     (_, Tool::DrawFolder) => "Drag a rectangle inside a folder to create a new folder of that size".to_string(),
                     _ => format!("Drag to select \u{00B7} {key} or middle click: hand tool \u{00B7} wheel to zoom \u{00B7} double-click a folder to open it"),
@@ -1601,6 +1699,9 @@ impl App {
                     self.custom_sizes.remove(&path);
                     self.layout_dirty = true;
                 }
+                if is_dir && self.arrange.get(&path).is_some_and(|o| o.has_own()) && menu_item(ui, "Reset arrangement", "", !multi) {
+                    self.reset_arrangement(&path);
+                }
                 if menu_item(ui, "Show in system file manager", "", !multi)
                     && let Err(e) = ops::reveal(&path) {
                         self.toast(e, ToastKind::Error);
@@ -1637,6 +1738,9 @@ impl App {
                 }
                 if menu_item(ui, "Refresh", "F5", true) {
                     self.request_scan(&ctx);
+                }
+                if self.arrange.get(&root).is_some_and(|o| o.has_own()) && menu_item(ui, "Reset arrangement", "", true) {
+                    self.reset_arrangement(&root);
                 }
                 if menu_item(ui, "Go to parent folder", "Alt+\u{2191}", self.root.parent().is_some()) {
                     self.go_up(&ctx);
@@ -1871,6 +1975,7 @@ impl App {
                         ("Click / Ctrl+click", "Select / toggle"),
                         ("Drag on empty", "Rubber-band select"),
                         ("Drag items", "Move \u{00B7} Ctrl = copy"),
+                        ("Drag between items", "Rearrange in own folder"),
                         ("Double-click", "Open file / folder as root"),
                         ("Double-click name", "Rename (also F2)"),
                         ("Ctrl+X / C / V", "Cut / copy / paste"),
@@ -1881,6 +1986,8 @@ impl App {
                 });
                 ui.add_space(8.0);
                 hint_box(ui, "The clipboard area on the left is a staging canvas: drop items there, then drag them onto any folder. Items marked MOVE are moved, items marked COPY are copied. Resize a folder by dragging its right or bottom edge.");
+                ui.add_space(6.0);
+                hint_box(ui, "Drop items between other items of their own folder to rearrange them: files between files, folders between the folders of a row, or in the gap above / below a row to start a new row. The arrangement is saved in a hidden .planar-layout.json in the canvas root.");
             });
             if resp.should_close() {
                 self.show_help = false;
@@ -2347,6 +2454,11 @@ impl App {
             eprintln!("zoom: {:.3}  offset: {:?}  tool: {:?}", self.cam.zoom, self.cam.offset, self.tool);
             eprintln!("rename: {:?}  custom: {:?}", self.rename.as_ref().map(|r| (&r.path, &r.text)), self.custom_sizes);
             eprintln!("toggle_key: {}  canvas_bg: {:?}  auto_depth: {}", self.settings.toggle_key, self.settings.canvas_bg, self.settings.auto_depth);
+            eprintln!("arrangement: {:?}", self.arrange.tree);
+            for it in self.layout.items.iter().filter(|it| it.depth == 1) {
+                let r = self.cam.rect_to_screen(self.main_rect, it.outer());
+                eprintln!("  item {} at ({:.0},{:.0})-({:.0},{:.0})", self.tree.nodes[it.node].name, r.left(), r.top(), r.right(), r.bottom());
+            }
         }
     }
 }

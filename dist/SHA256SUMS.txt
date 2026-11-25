@@ -1,0 +1,2 @@
+d16f9ac38a03ecbc5f1ce95b27bbf76cdd73c90ff40bf50170f21d253d384682  Planar-0.1.0-x64-setup.exe
+a073cb7508c2f7861385588bdee1f56648f63fe2a0a85af80820773c9f3dfebb  Planar-0.1.0-x64-portable.exe

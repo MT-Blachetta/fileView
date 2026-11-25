@@ -12,7 +12,7 @@ use egui::{
     Align, Align2, Color32, CursorIcon, FontId, Id, LayerId, Order, Painter, PointerButton, Pos2, Rect, Stroke,
     StrokeKind, Vec2, pos2, vec2,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const MIN_ZOOM: f32 = 0.008;
@@ -156,6 +156,45 @@ pub enum Gesture {
 }
 
 const DRAG_THRESHOLD: f32 = 5.0;
+
+/// Rearranging items inside their own folder, computed while dragging.
+#[derive(Clone, Debug)]
+pub struct ReorderPlan {
+    pub dir: PathBuf,
+    /// New order of the shown files (`None`: unchanged).
+    pub files: Option<Vec<String>>,
+    /// New rows of the shown sub-folders (`None`: unchanged).
+    pub rows: Option<Vec<Vec<String>>>,
+    /// Insertion markers (world line segments).
+    pub markers: Vec<(Pos2, Pos2)>,
+}
+
+/// A folder row on the canvas: (top, bottom, blocks as (name, outer rect)).
+type Row = (f32, f32, Vec<(String, Rect)>);
+
+/// Groups folder blocks into rows by their top edge, top to bottom and
+/// each row left to right.
+fn group_rows(blocks: impl IntoIterator<Item = (String, Rect)>) -> Vec<Row> {
+    let mut rows: Vec<Row> = vec![];
+    for (name, r) in blocks {
+        match rows.iter_mut().find(|row| (row.0 - r.top()).abs() < 0.5) {
+            Some(row) => {
+                row.1 = row.1.max(r.bottom());
+                row.2.push((name, r));
+            }
+            None => rows.push((r.top(), r.bottom(), vec![(name, r)])),
+        }
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for row in &mut rows {
+        row.2.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+    }
+    rows
+}
+
+fn row_names(rows: &[Row]) -> Vec<Vec<String>> {
+    rows.iter().map(|r| r.2.iter().map(|b| b.0.clone()).collect()).collect()
+}
 
 /// World rectangle of an item on the clipboard canvas (label included for folders).
 pub fn clip_item_rect(c: &ClipItem) -> Rect {
@@ -519,6 +558,7 @@ impl App {
     pub fn update_gesture(&mut self, ctx: &egui::Context) {
         if matches!(self.gesture, Gesture::None) {
             self.drop = DropTarget::None;
+            self.reorder = None;
             return;
         }
         let (pos, primary, middle, delta, mods) = ctx.input(|i| {
@@ -575,6 +615,14 @@ impl App {
                 let target = self.drop_target_at(s, if pane == Pane::Main { &items } else { &[] });
                 // Dragging within the clipboard canvas just repositions items.
                 let within_clip = pane == Pane::Clip && matches!(target, DropTarget::Clip(_));
+                // Dropping items in their own folder rearranges them.
+                let plan = match &target {
+                    DropTarget::Dir(d) if pane == Pane::Main && !mods.command => {
+                        let w = self.cam.to_world(self.main_rect, s);
+                        self.reorder_plan(d, w, &items)
+                    }
+                    _ => None,
+                };
                 if down {
                     ctx.set_cursor_icon(if within_clip { CursorIcon::Grabbing } else if mods.command { CursorIcon::Copy } else { CursorIcon::Grabbing });
                     let mut lw = last_world;
@@ -590,10 +638,14 @@ impl App {
                     }
                     self.autopan(s);
                     self.drop = if within_clip { DropTarget::None } else { target };
+                    self.reorder = plan;
                     Gesture::Drag { pane, items, last_world: lw }
                 } else {
                     self.drop = DropTarget::None;
-                    if !within_clip {
+                    self.reorder = None;
+                    if let Some(plan) = plan {
+                        self.apply_reorder(plan);
+                    } else if !within_clip {
                         self.perform_drop(ctx, pane, &items, target, mods.command);
                     }
                     Gesture::None
@@ -713,6 +765,126 @@ impl App {
         }
     }
 
+    /// Where `items` would go when dropped at world point `w` inside their
+    /// own folder `dir`: files between the files nearest to the pointer,
+    /// folders between two folders of a row or (in the gap above / below a
+    /// row) into a new row. `None` if not all items live in `dir`.
+    pub fn reorder_plan(&self, dir: &Path, w: Pos2, items: &[PathBuf]) -> Option<ReorderPlan> {
+        if items.is_empty() || items.iter().any(|p| p.parent() != Some(dir)) {
+            return None;
+        }
+        let lay = &self.layout.items;
+        let (start, stop) = if dir == self.root {
+            (0, lay.len())
+        } else {
+            let &i = self.layout.by_path.get(dir)?;
+            if lay[i].collapsed {
+                return None;
+            }
+            (i + 1, lay[i].end)
+        };
+        let dragged: HashSet<&Path> = items.iter().map(PathBuf::as_path).collect();
+        // Direct children in display order, split into dragged and staying.
+        let (mut files, mut moved_files, mut all_files) = (vec![], vec![], vec![]);
+        let (mut dirs, mut moved_dirs, mut all_dirs) = (vec![], vec![], vec![]);
+        let mut i = start;
+        while i < stop {
+            let it = &lay[i];
+            let node = &self.tree.nodes[it.node];
+            let moved = dragged.contains(node.path.as_path());
+            match it.kind {
+                Kind::File => {
+                    all_files.push(node.name.clone());
+                    if moved {
+                        moved_files.push(node.name.clone());
+                    } else {
+                        files.push((node.name.clone(), it.rect));
+                    }
+                }
+                Kind::Dir => {
+                    all_dirs.push((node.name.clone(), it.outer()));
+                    if moved {
+                        moved_dirs.push((node.name.clone(), it.outer()));
+                    } else {
+                        dirs.push((node.name.clone(), it.outer()));
+                    }
+                }
+                Kind::More(_) => {}
+            }
+            i = if it.kind == Kind::Dir { it.end } else { i + 1 };
+        }
+        let mut plan = ReorderPlan { dir: dir.to_path_buf(), files: None, rows: None, markers: vec![] };
+
+        // Files: insert before the first file that comes after the pointer.
+        if !moved_files.is_empty() && !files.is_empty() {
+            let k = files
+                .iter()
+                .position(|(_, r)| w.y < r.top() || (w.y < r.bottom() && w.x < r.center().x))
+                .unwrap_or(files.len());
+            let (x, r) = match files.get(k) {
+                Some((_, r)) => (r.left(), *r),
+                None => (files[k - 1].1.right(), files[k - 1].1),
+            };
+            plan.markers.push((pos2(x, r.top() + 4.0), pos2(x, r.bottom() - 4.0)));
+            let mut names: Vec<String> = files.into_iter().map(|f| f.0).collect();
+            names.splice(k..k, moved_files);
+            if names != all_files {
+                plan.files = Some(names);
+            }
+        }
+
+        // Folders: between two folders of a row, or a new row in the gap
+        // above / below a row.
+        if !moved_dirs.is_empty() && !dirs.is_empty() {
+            let mut rows = group_rows(dirs);
+            let n = rows.len();
+            let blocks = || rows.iter().flat_map(|r| r.2.iter());
+            let left = blocks().map(|b| b.1.left()).fold(f32::INFINITY, f32::min);
+            let right = blocks().map(|b| b.1.right()).fold(f32::NEG_INFINITY, f32::max);
+            // A band along a row's top and bottom edge counts as gap too, so
+            // that the narrow gaps are easy to hit at any zoom level.
+            let tol = |r: &Row| (8.0 / self.cam.zoom).min((r.1 - r.0) * 0.2);
+            let mut slot = (n, None);
+            for (ri, row) in rows.iter().enumerate() {
+                if w.y < row.0 + tol(row) {
+                    slot = (ri, None);
+                    break;
+                }
+                if w.y <= row.1 - tol(row) {
+                    slot = (ri, Some(row.2.iter().filter(|b| b.1.center().x < w.x).count()));
+                    break;
+                }
+            }
+            match slot {
+                (ri, Some(k)) => {
+                    let row = &rows[ri];
+                    let x = match row.2.get(k) {
+                        Some(b) => b.1.left() - layout::GAP_X / 2.0,
+                        None => row.2[k - 1].1.right() + layout::GAP_X / 2.0,
+                    };
+                    plan.markers.push((pos2(x, row.0), pos2(x, row.1)));
+                    rows[ri].2.splice(k..k, moved_dirs);
+                }
+                (ri, None) => {
+                    let y = if ri == 0 {
+                        rows[0].0 - layout::SECTION_GAP / 2.0
+                    } else if ri == n {
+                        rows[n - 1].1 + layout::GAP_Y / 2.0
+                    } else {
+                        (rows[ri - 1].1 + rows[ri].0) / 2.0
+                    };
+                    plan.markers.push((pos2(left, y), pos2(right, y)));
+                    rows.insert(ri, (0.0, 0.0, moved_dirs));
+                }
+            }
+            let names = row_names(&rows);
+            if names != row_names(&group_rows(all_dirs)) {
+                plan.rows = Some(names);
+            }
+        }
+        if plan.markers.is_empty() { None } else { Some(plan) }
+    }
+
     fn perform_drop(&mut self, ctx: &egui::Context, pane: Pane, items: &[PathBuf], target: DropTarget, ctrl: bool) {
         match (pane, target) {
             (Pane::Main, DropTarget::Clip(w)) => {
@@ -803,9 +975,20 @@ impl App {
 
         // Drop highlight for the root (the canvas itself).
         if let DropTarget::Dir(d) = &self.drop
-            && d == &self.root {
+            && d == &self.root
+            && self.reorder.is_none() {
                 p.rect_stroke(vp.shrink(3.0), 6.0, Stroke::new(3.0, theme::accent_soft(0.6)), StrokeKind::Inside);
             }
+        // Insertion markers while rearranging.
+        if let Some(plan) = &self.reorder {
+            let w = (3.0 * z.min(1.0)).max(2.0);
+            for &(a, b) in &plan.markers {
+                let (a, b) = (self.cam.to_screen(vp, a), self.cam.to_screen(vp, b));
+                p.line_segment([a, b], Stroke::new(w, theme::ACCENT));
+                p.circle_filled(a, w * 1.4, theme::ACCENT);
+                p.circle_filled(b, w * 1.4, theme::ACCENT);
+            }
+        }
         match &self.gesture {
             Gesture::Marquee { pane: Pane::Main, start, cur, .. } => {
                 let r = self.cam.rect_to_screen(vp, Rect::from_two_pos(*start, *cur));
@@ -835,7 +1018,7 @@ impl App {
         Look {
             selected: self.sel.contains(path),
             hovered: self.hover.map(|h| h.idx) == Some(idx) && matches!(self.gesture, Gesture::None),
-            drop: matches!(&self.drop, DropTarget::Dir(d) if d == path),
+            drop: self.reorder.is_none() && matches!(&self.drop, DropTarget::Dir(d) if d == path),
             ghost: in_clip_move || dragging,
             dim: searching && !matched && !self.match_ancestors.contains(path),
             hidden: false,
@@ -945,6 +1128,7 @@ impl App {
         }
         let copy = ctrl || (*pane == Pane::Clip && items.iter().all(|i| self.clip.iter().any(|c| &c.path == i && c.mode == ClipMode::Copy)));
         let text = match &self.drop {
+            DropTarget::Dir(d) if self.reorder.is_some() => format!("Rearrange in {}", fsmodel::display_name(d)),
             DropTarget::Dir(d) => {
                 let verb = if copy { "Copy to" } else { "Move to" };
                 format!("{verb} {}", fsmodel::display_name(d))

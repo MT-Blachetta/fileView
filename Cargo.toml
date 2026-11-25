@@ -3,7 +3,9 @@ name = "planar"
 version = "0.1.0"
 edition = "2024"
 description = "Planar - a file explorer on an infinite canvas"
+authors = ["Michael Blachetta"]
 license = "MIT"
+repository = "https://github.com/MT-Blachetta/fileView"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "x11", "wayland"] }
@@ -12,6 +14,15 @@ open = "5"
 trash = "5"
 serde = { version = "1", features = ["derive"] }
 rfd = "0.17"
+serde_json = "1"
+
+# Windows also gets the wgpu renderer (Direct3D 12 / Vulkan), see main.rs.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu"] }
+
+# Embeds the icon, version info and manifest into planar.exe, see build.rs.
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

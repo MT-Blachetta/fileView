@@ -88,6 +88,8 @@ pub struct Tree {
     pub dir_mtimes: Vec<(PathBuf, Option<SystemTime>)>,
     pub budget_exhausted: bool,
     pub total_entries: usize,
+    /// Loaded folders that contain a layout file (see `arrange`).
+    pub layout_files: Vec<PathBuf>,
 }
 
 impl Tree {
@@ -109,7 +111,14 @@ impl Tree {
             omitted: 0,
             error: None,
         };
-        Tree { nodes: vec![node], root: 0, dir_mtimes: vec![], budget_exhausted: false, total_entries: 0 }
+        Tree {
+            nodes: vec![node],
+            root: 0,
+            dir_mtimes: vec![],
+            budget_exhausted: false,
+            total_entries: 0,
+            layout_files: vec![],
+        }
     }
 
     pub fn root_node(&self) -> &Node {
@@ -140,7 +149,10 @@ impl Tree {
             }
             tree.dir_mtimes.push((path.clone(), fs::metadata(&path).and_then(|m| m.modified()).ok()));
             match read_children(&path, opts) {
-                Ok(mut entries) => {
+                Ok((mut entries, has_layout)) => {
+                    if has_layout {
+                        tree.layout_files.push(path.clone());
+                    }
                     sort_entries(&mut entries, opts.sort, opts.sort_desc);
                     let total = entries.len();
                     let mut dirs = vec![];
@@ -186,11 +198,18 @@ impl Tree {
     }
 }
 
-fn read_children(dir: &Path, opts: &ScanOptions) -> std::io::Result<Vec<Node>> {
+/// Reads the entries of `dir`. The layout file is never shown; the flag
+/// tells whether `dir` has one.
+fn read_children(dir: &Path, opts: &ScanOptions) -> std::io::Result<(Vec<Node>, bool)> {
     let mut out = vec![];
+    let mut has_layout = false;
     for entry in fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == crate::arrange::FILE_NAME {
+            has_layout = true;
+            continue;
+        }
         let path = entry.path();
         let ftype = entry.file_type().ok();
         let is_symlink = ftype.map(|t| t.is_symlink()).unwrap_or(false);
@@ -219,14 +238,16 @@ fn read_children(dir: &Path, opts: &ScanOptions) -> std::io::Result<Vec<Node>> {
             error: None,
         });
     }
-    Ok(out)
+    Ok((out, has_layout))
 }
 
 fn count_entries(dir: &Path, show_hidden: bool) -> Option<usize> {
     let rd = fs::read_dir(dir).ok()?;
     let mut n = 0;
     for e in rd.flatten().take(100_000) {
-        if !show_hidden && e.file_name().to_string_lossy().starts_with('.') {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name == crate::arrange::FILE_NAME || !show_hidden && name.starts_with('.') {
             continue;
         }
         n += 1;

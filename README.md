@@ -10,8 +10,24 @@ stage files and folders and then drop them anywhere.
 
 It is written in **Rust** with **egui/eframe**. The same source compiles to a
 single native executable for **Windows** (`planar.exe`) and **Linux**
-(`planar`). The app needs no runtime, installer or web view, and the fonts are
-embedded.
+(`planar`). The app needs no runtime or web view, and the fonts are embedded.
+On Windows it ships as an installer and as a portable `.exe`.
+
+## Installing on Windows
+
+Download `Planar-<version>-x64-setup.exe` from the
+[releases](https://github.com/MT-Blachetta/fileView/releases) and run it. It
+installs Planar for the current user (no administrator rights needed), adds a
+Start menu entry and an uninstaller under *Settings → Apps*. It runs on
+Windows 10 and 11 (x64; ARM64 PCs run it through emulation).
+`Planar-<version>-x64-portable.exe` is the same program without the
+installer. `SHA256SUMS.txt` lists the checksums of both:
+`Get-FileHash Planar-<version>-x64-setup.exe` must print the same value.
+
+As long as the release is not code-signed (see [Code signing](#code-signing)),
+Microsoft Defender SmartScreen shows *"Windows protected your PC"* for the
+downloaded file. Click **More info → Run anyway**, or right-click the file →
+*Properties* → tick **Unblock** → *OK*.
 
 ## Layout
 
@@ -47,6 +63,50 @@ embedded.
 * After any change, the layout is recomputed. That includes changes made by
   other programs: loaded folders are polled every 2.5 s.
 
+### Rearranging items
+Items start out in the sort order (by name unless changed in *View*). To
+change the order, drag items and drop them between other items **of their
+own folder**:
+
+* **Files**: drop a file between two files (or before the first / after the
+  last one). The other files shift to make room. Files always stay above the
+  folders.
+* **Folders**: drop a folder in the gap between two folders of a row (or at
+  either end of a row) to place it there. Drop it in the gap above or below a
+  row to put it into a new row of its own.
+
+A blue marker shows where the items will go while you drag. Dropping onto a
+folder (its body or name) still moves items into it, as before. `Ctrl+Z`
+undoes a rearrangement; *Reset arrangement* in a folder's context menu (or on
+the empty canvas, for the root) returns that folder to the sort order, and
+*View* → *Reset arrangement of this canvas* resets every folder.
+
+The arrangement is saved in a hidden file, `.planar-layout.json`, in the canvas
+root folder. It is created on the first rearrangement and read before the
+canvas is drawn. It mirrors the folder tree: for each rearranged folder it
+holds the file order (`files`), the folder rows (`rows`, top to bottom, each
+left to right) and the same for its sub-folders (`children`):
+
+```json
+{
+  "format": "planar-layout",
+  "version": 1,
+  "tree": {
+    "files": ["notes.txt", "a.txt"],
+    "rows": [["src", "docs"], ["assets"]],
+    "children": { "src": { "files": ["main.rs", "app.rs"] } }
+  }
+}
+```
+
+Items the file does not mention (new ones, or ones never moved) follow the
+sort order after the arranged ones. Renamed items keep their place, and a
+moved folder takes the arrangement of its contents along. If a folder has no
+layout file of its own, opening it as the root uses its entry in the nearest
+parent folder's file, and changes are written back to both, so the
+arrangement looks the same from either root. The file itself never appears on
+the canvas.
+
 ## Using it
 
 | Action | How |
@@ -56,6 +116,7 @@ embedded.
 | Zoom | Mouse wheel / pinch at the cursor, `Ctrl +` / `Ctrl −`, `Ctrl+0` to fit, `Ctrl+1` for 100 % |
 | Select | Click; `Ctrl`/`Shift` + click to toggle; drag on empty space (also inside a folder) for rubber-band selection |
 | Move | Drag items onto a folder (or onto empty canvas = the root) |
+| Rearrange | Drop items between other items of their own folder (see [Rearranging items](#rearranging-items)) |
 | Copy | Hold `Ctrl` while dropping |
 | Stage | Drag items to the clipboard area, then drag them from there onto a folder |
 | Cut / Copy / Paste | `Ctrl+X` / `Ctrl+C` add the selection to the clipboard area. To paste, right-click a folder and choose *Paste*, or press `Ctrl+V` to paste into the selected folder |
@@ -65,7 +126,7 @@ embedded.
 | New | `Ctrl+Shift+N` folder, `Ctrl+N` text file, toolbar buttons, the context menu, or the **draw-folder tool** (`F`): drag a rectangle to create a folder of that size |
 | Expand / collapse | Click the arrow next to a folder name |
 | Delete | `Del` moves to the trash, `Shift+Del` deletes permanently (asks for confirmation) |
-| Undo | `Ctrl+Z` (moves, renames, copies, new items) |
+| Undo | `Ctrl+Z` (moves, renames, copies, new items, rearrangements) |
 | Files from other apps | Drop them on a folder to copy them in, or on the clipboard area to stage them |
 
 The context menu (right-click) works on files, on folders (click the border,
@@ -90,24 +151,78 @@ libxkbcommon), which Ubuntu desktop installs by default.
 `scripts/planar.desktop` is a launcher entry you can copy to
 `~/.local/share/applications/`.
 
+`scripts/build-release.sh` copies the Linux executable into `dist/`.
+
 ### Windows
-On Windows:
+Requirements: Rust with the MSVC toolchain, the Visual Studio Build Tools
+(C++ workload) and Inno Setup 6:
+```powershell
+winget install Rustlang.Rustup JRSoftware.InnoSetup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+Build and run:
 ```powershell
 cargo build --release
 target\release\planar.exe
 ```
-The release build is a GUI-subsystem executable, so no console window opens.
-
-### Cross-compiling the Windows `.exe` on Linux
-```bash
-rustup target add x86_64-pc-windows-gnu
-# either: sudo apt install mingw-w64 && cargo build --release --target x86_64-pc-windows-gnu
-# or:     cargo install cargo-zigbuild  (with zig on PATH)
-#         cargo zigbuild --release --target x86_64-pc-windows-gnu
+To build the release files, run:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
-`scripts/build-release.sh` builds both executables into `dist/`.
+It runs the tests, builds `planar.exe` and writes the installer, the portable
+executable and `SHA256SUMS.txt` to `dist\`.
+
+What makes the Windows build work smoothly:
+* **MSVC toolchain** instead of a mingw/zig cross-build from Linux. Antivirus
+  heuristics flag mingw-built Rust executables much more often.
+* **Embedded resources** (`build.rs`): file icon, version info (product,
+  company, version) and an application manifest (runs as the current user,
+  per-monitor DPI aware, long paths, Windows 10/11).
+* **Statically linked C runtime** (`.cargo/config.toml`), so the Visual C++
+  Redistributable is not needed.
+* **Renderer fallback** (`src/main.rs`): Direct3D 12 through wgpu, including
+  the WARP software renderer on PCs and VMs without a GPU driver, then
+  OpenGL. Vulkan is deliberately not used, because some Vulkan drivers crash
+  while wgpu enumerates them. If neither works, a dialog says so instead of the window
+  silently not appearing.
+* The release build is a GUI-subsystem executable, so no console window
+  opens.
+
 `.github/workflows/build.yml` builds and tests both platforms on GitHub
-Actions.
+Actions and uploads the installer. Pushing a tag such as `v0.2.0` also
+publishes a GitHub Release with the installer, the portable `.exe`, the
+checksums and the Linux binary.
+
+### Code signing
+Only a code-signing certificate from a trusted certificate authority gets rid
+of SmartScreen's *"unknown publisher"* warning. With a certificate, the build
+script signs `planar.exe`, the installer and the uninstaller, and adds an
+RFC 3161 timestamp so the signatures stay valid after the certificate expires:
+```powershell
+# certificate in the Windows certificate store (also USB tokens, Certum SimplySign)
+scripts\build-windows.ps1 -CertThumbprint <SHA-1 thumbprint>
+# or a .pfx file
+scripts\build-windows.ps1 -PfxFile cert.pfx -PfxPassword <password>
+```
+The same values can be given as the environment variables
+`PLANAR_SIGN_THUMBPRINT`, `PLANAR_SIGN_PFX` and `PLANAR_SIGN_PFX_PASSWORD`.
+signtool comes with the Windows SDK, which the Build Tools install.
+
+Ways to get a certificate:
+* **Certum Open Source Code Signing**: inexpensive, for individual open-source
+  developers. The certificate lives in the cloud (SimplySign) and shows up in
+  the Windows certificate store, so `-CertThumbprint` works.
+* **SignPath Foundation**: free signing for qualifying open-source projects;
+  it signs inside GitHub Actions.
+* **Azure Trusted Signing**: Microsoft's signing service with a monthly fee;
+  check its current eligibility rules for individuals and companies.
+* A regular OV code-signing certificate from any CA (delivered on a hardware
+  token).
+
+A new certificate still has to build up SmartScreen reputation through
+downloads, so the warning can appear for a short while after the first signed
+release. If Microsoft Defender itself reports the file as a threat, submit it
+as a false positive at <https://www.microsoft.com/wdsi/filesubmission>.
 
 ## Code map
 
@@ -115,6 +230,7 @@ Actions.
 |---|---|
 | `src/fsmodel.rs` | Breadth-first directory scan with a node budget, sorting, size/time formatting |
 | `src/layout.rs` | Nested rectangle layout (file grid and shelf-packed sub-folders) |
+| `src/arrange.rs` | Custom item order (drag to rearrange) and its hidden `.planar-layout.json` file |
 | `src/canvas.rs` | Camera, hit testing, painting, pointer gestures (pan, marquee, drag & drop, resize, draw) |
 | `src/app.rs` | App state, actions, undo, background jobs, panels, menus, shortcuts |
 | `src/ops.rs` | Move / copy / rename / create / trash, run in a background thread |
@@ -129,9 +245,12 @@ Run the unit tests with `cargo test`.
   automatically, breadth first. Deeper folders show as collapsed cards that
   load when you expand them, and folders with more than 400 files show a
   "+N more" tile.
-* Folder positions are always computed automatically. The draw-folder tool
+* Folder positions are computed automatically from the order and rows
+  (see *Rearranging items*); there is no free placement. The draw-folder tool
   sets a new folder's size, not its position.
-* The executable's file icon on Windows is the default one. The window icon
-  is set at runtime.
+* Rearranging needs write access to the canvas root: in read-only folders the
+  new order lasts only until the app closes.
+* The Windows file icon (`assets/planar.ico`) is generated from the same
+  shapes as the window icon by `scripts/make-icon.py`.
 * The Inter font is embedded under the SIL Open Font License
   (`assets/Inter-LICENSE.txt`).

@@ -6,26 +6,53 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            artifact: planar-linux-x86_64
-            binary: target/release/planar
-          - os: windows-latest
-            artifact: planar-windows-x86_64
-            binary: target/release/planar.exe
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev
-      - run: cargo test --release
-      - run: cargo build --release
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.binary }}
+          name: planar-linux-x86_64
+          path: target/release/planar
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      # Builds with MSVC, runs the tests and packages the installer. Unsigned
+      # unless PLANAR_SIGN_* variables are provided (see README, "Code signing").
+      - name: Build installer
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: planar-windows-x64
+          path: |
+            dist/Planar-*-x64-setup.exe
+            dist/Planar-*-x64-portable.exe
+            dist/SHA256SUMS.txt
+
+  # Pushing a tag such as v0.2.0 publishes a GitHub Release with the installer.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Rename Linux binary
+        run: mv planar-linux-x86_64/planar planar-linux-x86_64/planar-${GITHUB_REF_NAME#v}-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            planar-windows-x64/*
+            planar-linux-x86_64/*

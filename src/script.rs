@@ -2,7 +2,7 @@
 //!
 //! One command per line, executed frame by frame:
 //! `wait N`, `move X Y`, `click X Y`, `dclick X Y`, `rclick X Y`, `mclick X Y`, `tap MOD`,
-//! `drag X1 Y1 X2 Y2 [ctrl]`, `scroll X Y DY`, `key NAME [ctrl] [shift] [alt]`, `type TEXT`,
+//! `down X Y`, `up X Y`, `drag X1 Y1 X2 Y2 [ctrl]`, `scroll X Y DY`, `key NAME [ctrl] [shift] [alt]`, `type TEXT`,
 //! `copy`, `cut`, `paste`, `shot FILE.ppm`, `print`, `quit`. Lines starting with `#` are ignored.
 
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, pos2};
@@ -79,6 +79,13 @@ impl Script {
                         steps.push_back(Step::Events(vec![button(p, b, true, m)], m));
                         steps.push_back(Step::Events(vec![button(p, b, false, m)], m));
                     }
+                    steps.push_back(Step::Wait(2));
+                }
+                "down" | "up" => {
+                    // Separate press / release, e.g. for a screenshot in the middle of a drag.
+                    let p = pos(&a, 1);
+                    steps.push_back(Step::Events(vec![Event::PointerMoved(p)], m));
+                    steps.push_back(Step::Events(vec![button(p, PointerButton::Primary, *cmd == "down", m)], m));
                     steps.push_back(Step::Wait(2));
                 }
                 "drag" => {
